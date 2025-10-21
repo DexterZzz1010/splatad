@@ -1,5 +1,9 @@
+import functools
 import math
-from typing import Dict, Optional, Tuple, Union
+import sys
+import warnings
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -17,6 +21,171 @@ from .cuda._wrapper import (
     rasterize_to_points,
     spherical_harmonics,
 )
+
+
+@functools.lru_cache(maxsize=1)
+def _load_gsplat_original_modules():
+    """Lazy-load the official gsplat modules for 3DGUT support."""
+    try:
+        from gsplat_original.gsplat import rendering as gut_rendering  # type: ignore
+        from gsplat_original.gsplat.cuda import _wrapper as gut_wrapper  # type: ignore
+    except ImportError as exc:
+        repo_root = Path(__file__).resolve().parents[2]
+        candidate = repo_root / "gsplat_original"
+        attempted_paths = []
+        if candidate.exists():
+            candidate_parent = candidate.parent
+            if str(candidate_parent) not in sys.path:
+                sys.path.append(str(candidate_parent))
+                attempted_paths.append(candidate_parent)
+            if str(candidate) not in sys.path:
+                sys.path.append(str(candidate))
+                attempted_paths.append(candidate)
+            try:
+                from gsplat_original.gsplat import rendering as gut_rendering  # type: ignore
+                from gsplat_original.gsplat.cuda import _wrapper as gut_wrapper  # type: ignore
+            except ImportError:
+                hint_paths = ", ".join(str(p) for p in attempted_paths) or "sys.path"
+                raise RuntimeError(
+                    "3DGUT support requires the official gsplat repository to be importable "
+                    f"(attempted to add: {hint_paths}). Please ensure 'gsplat_original' "
+                    "is installed or available on PYTHONPATH."
+                ) from exc
+        else:
+            raise RuntimeError(
+                "3DGUT support requires the official 'gsplat_original' repository. "
+                "Clone it alongside this project or install it as a package."
+            ) from exc
+    return gut_rendering, gut_wrapper
+
+
+def _maybe_make_ut_params(
+    gut_wrapper: Any, ut_params: Optional[Dict[str, Any]]
+) -> Any:
+    if ut_params is None:
+        return gut_wrapper.UnscentedTransformParameters()
+    return gut_wrapper.UnscentedTransformParameters(**ut_params)
+
+
+def _maybe_make_ftheta_params(
+    gut_wrapper: Any, ftheta_coeffs: Optional[Any]
+) -> Optional[Any]:
+    if ftheta_coeffs is None:
+        return None
+    if isinstance(ftheta_coeffs, gut_wrapper.FThetaCameraDistortionParameters):
+        return ftheta_coeffs
+    if isinstance(ftheta_coeffs, dict):
+        return gut_wrapper.FThetaCameraDistortionParameters(**ftheta_coeffs)
+    raise TypeError(
+        "ftheta_coeffs must be either a dict or "
+        "gsplat_original.gsplat.cuda._wrapper.FThetaCameraDistortionParameters."
+    )
+
+
+def _resolve_rolling_shutter(
+    gut_wrapper: Any, rolling_shutter: Optional[Union[str, Any]]
+) -> Any:
+    if rolling_shutter is None:
+        return gut_wrapper.RollingShutterType.GLOBAL
+    if isinstance(rolling_shutter, gut_wrapper.RollingShutterType):
+        return rolling_shutter
+    if isinstance(rolling_shutter, str):
+        key = rolling_shutter.strip().upper()
+        try:
+            return gut_wrapper.RollingShutterType[key]
+        except KeyError as exc:
+            valid = ", ".join(t.name.lower() for t in gut_wrapper.RollingShutterType)
+            raise ValueError(
+                f"Unknown rolling_shutter '{rolling_shutter}'. Valid values: {valid}."
+            ) from exc
+    raise TypeError(
+        "rolling_shutter must be None, a string, or "
+        "gsplat_original.gsplat.cuda._wrapper.RollingShutterType."
+    )
+
+
+def _rasterize_with_3dgut(
+    *,
+    means: Tensor,
+    quats: Tensor,
+    scales: Tensor,
+    opacities: Tensor,
+    colors: Tensor,
+    viewmats: Tensor,
+    Ks: Tensor,
+    width: int,
+    height: int,
+    near_plane: float,
+    far_plane: float,
+    radius_clip: float,
+    eps2d: float,
+    sh_degree: Optional[int],
+    packed: bool,
+    tile_size: int,
+    backgrounds: Optional[Tensor],
+    render_mode: str,
+    sparse_grad: bool,
+    absgrad: bool,
+    rasterize_mode: str,
+    channel_chunk: int,
+    distributed: bool,
+    camera_model: str,
+    segmented: bool,
+    covars: Optional[Tensor],
+    with_ut: bool,
+    with_eval3d: bool,
+    radial_coeffs: Optional[Tensor],
+    tangential_coeffs: Optional[Tensor],
+    thin_prism_coeffs: Optional[Tensor],
+    ftheta_coeffs: Optional[Any],
+    rolling_shutter: Optional[Union[str, Any]],
+    viewmats_rs: Optional[Tensor],
+    ut_params: Optional[Dict[str, Any]],
+) -> Tuple[Tensor, Tensor, Dict]:
+    gut_rendering, gut_wrapper = _load_gsplat_original_modules()
+
+    ut_params_obj = _maybe_make_ut_params(gut_wrapper, ut_params)
+    ftheta_coeffs_obj = _maybe_make_ftheta_params(gut_wrapper, ftheta_coeffs)
+    rolling_shutter_enum = _resolve_rolling_shutter(gut_wrapper, rolling_shutter)
+
+    result = gut_rendering.rasterization(
+        means=means,
+        quats=quats,
+        scales=scales,
+        opacities=opacities,
+        colors=colors,
+        viewmats=viewmats,
+        Ks=Ks,
+        width=width,
+        height=height,
+        near_plane=near_plane,
+        far_plane=far_plane,
+        radius_clip=radius_clip,
+        eps2d=eps2d,
+        sh_degree=sh_degree,
+        packed=packed,
+        tile_size=tile_size,
+        backgrounds=backgrounds,
+        render_mode=render_mode,
+        sparse_grad=sparse_grad,
+        absgrad=absgrad,
+        rasterize_mode=rasterize_mode,
+        channel_chunk=channel_chunk,
+        distributed=distributed,
+        camera_model=camera_model,
+        segmented=segmented,
+        covars=covars,
+        with_ut=with_ut,
+        with_eval3d=with_eval3d,
+        radial_coeffs=radial_coeffs,
+        tangential_coeffs=tangential_coeffs,
+        thin_prism_coeffs=thin_prism_coeffs,
+        ftheta_coeffs=ftheta_coeffs_obj,
+        rolling_shutter=rolling_shutter_enum,
+        viewmats_rs=viewmats_rs,
+        ut_params=ut_params_obj,
+    )
+    return result
 
 
 def rasterization(
@@ -46,6 +215,20 @@ def rasterization(
     absgrad: bool = False,
     rasterize_mode: Literal["classic", "antialiased"] = "classic",
     channel_chunk: int = 32,
+    *,
+    distributed: bool = False,
+    camera_model: Literal["pinhole", "ortho", "fisheye", "ftheta"] = "pinhole",
+    segmented: bool = False,
+    covars: Optional[Tensor] = None,
+    with_ut: bool = False,
+    with_eval3d: bool = False,
+    radial_coeffs: Optional[Tensor] = None,
+    tangential_coeffs: Optional[Tensor] = None,
+    thin_prism_coeffs: Optional[Tensor] = None,
+    ftheta_coeffs: Optional[Any] = None,
+    rolling_shutter: Optional[Union[str, Any]] = None,
+    viewmats_rs: Optional[Tensor] = None,
+    ut_params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -161,6 +344,29 @@ def rasterization(
         channel_chunk: The number of channels to render in one go. Default is 32.
             If the required rendering channels are larger than this value, the rendering
             will be done looply in chunks.
+        distributed: If True, delegate rasterization to the official gsplat distributed path.
+        camera_model: Camera model hint passed to the official gsplat implementation when
+            3DGUT parameters are enabled. Default is "pinhole".
+        segmented: Enables segmented radix sort in the official pipeline. Default is False.
+        covars: Optional covariance matrices to bypass quaternion/scale projection when
+            calling the official pipeline.
+        with_ut: If True, enable Unscented Transform support (3DGUT). Delegates to the
+            official gsplat implementation.
+        with_eval3d: If True, evaluate Gaussians in 3D (3DGUT). Delegates to the official
+            gsplat implementation.
+        radial_coeffs: Radial distortion coefficients. Only used when delegating to
+            the official implementation.
+        tangential_coeffs: Tangential distortion coefficients. Only used when delegating
+            to the official implementation.
+        thin_prism_coeffs: Thin prism distortion coefficients. Only used when delegating
+            to the official implementation.
+        ftheta_coeffs: F-Theta distortion parameters. Accepts either the official dataclass
+            or a kwargs dict to construct it.
+        rolling_shutter: Rolling shutter mode ("global", "rolling_top_to_bottom", etc) or
+            the official enum. Only used when delegating.
+        viewmats_rs: Optional rolling-shutter view matrices forwarded to the official code.
+        ut_params: Optional dict to instantiate UnscentedTransformParameters for the official
+            implementation.
 
     Returns:
         A tuple:
@@ -201,6 +407,91 @@ def rasterization(
         'flatten_ids', 'isect_offsets', 'width', 'height', 'tile_size'])
 
     """
+    use_official_backend = (
+        with_ut
+        or with_eval3d
+        or camera_model != "pinhole"
+        or radial_coeffs is not None
+        or tangential_coeffs is not None
+        or thin_prism_coeffs is not None
+        or ftheta_coeffs is not None
+        or viewmats_rs is not None
+        or rolling_shutter is not None
+        or distributed
+        or segmented
+        or covars is not None
+    )
+
+    if use_official_backend:
+        if velocities is not None:
+            warnings.warn(
+                "3DGUT path ignores per-Gaussian velocities; continuing without them.",
+                stacklevel=2,
+            )
+        if any(v is not None for v in (linear_velocity, angular_velocity)):
+            warnings.warn(
+                "Camera linear/angular velocities are not consumed by the official "
+                "3DGUT rasterizer. Provide rolling_shutter/viewmats_rs instead.",
+                stacklevel=2,
+            )
+        if rolling_shutter_time is not None:
+            warnings.warn(
+                "rolling_shutter_time is ignored by the official 3DGUT rasterizer. "
+                "Supply rolling_shutter/viewmats_rs to control rolling shutter.",
+                stacklevel=2,
+            )
+
+        render, alpha, meta = _rasterize_with_3dgut(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            viewmats=viewmats,
+            Ks=Ks,
+            width=width,
+            height=height,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            radius_clip=radius_clip,
+            eps2d=eps2d,
+            sh_degree=sh_degree,
+            packed=packed,
+            tile_size=tile_size,
+            backgrounds=backgrounds,
+            render_mode=render_mode,
+            sparse_grad=sparse_grad,
+            absgrad=absgrad,
+            rasterize_mode=rasterize_mode,
+            channel_chunk=channel_chunk,
+            distributed=distributed,
+            camera_model=camera_model,
+            segmented=segmented,
+            covars=covars,
+            with_ut=with_ut,
+            with_eval3d=with_eval3d,
+            radial_coeffs=radial_coeffs,
+            tangential_coeffs=tangential_coeffs,
+            thin_prism_coeffs=thin_prism_coeffs,
+            ftheta_coeffs=ftheta_coeffs,
+            rolling_shutter=rolling_shutter,
+            viewmats_rs=viewmats_rs,
+            ut_params=ut_params,
+        )
+
+        if "pix_vels" not in meta:
+            if packed:
+                nnz = meta.get("means2d", torch.empty(0, 2, device=means.device)).shape[0]
+                meta["pix_vels"] = torch.zeros(
+                    nnz, 2, dtype=means.dtype, device=means.device
+                )
+            else:
+                C = viewmats.shape[0]
+                N = means.shape[0]
+                meta["pix_vels"] = torch.zeros(
+                    C, N, 2, dtype=means.dtype, device=means.device
+                )
+        return render, alpha, meta
 
     N = means.shape[0]
     C = viewmats.shape[0]
